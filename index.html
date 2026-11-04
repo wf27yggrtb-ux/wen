@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>情绪花园</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #1a1f2e;
+    display: flex; justify-content: center; align-items: center;
+    min-height: 100vh; color: #e8e4dc;
+    overflow: hidden;
+  }
+  #app {
+    width: 100%; max-width: 520px; height: 100vh; max-height: 860px;
+    display: flex; flex-direction: column;
+    background: #232a3d; position: relative;
+    box-shadow: 0 0 60px rgba(0,0,0,.6);
+  }
+  header {
+    padding: 14px 18px 8px;
+    display: flex; justify-content: space-between; align-items: baseline;
+  }
+  header h1 { font-size: 17px; font-weight: 600; letter-spacing: 2px; }
+  header .count { font-size: 11px; opacity: .5; }
+  #garden-wrap { flex: 1; position: relative; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #mood-panel {
+    padding: 10px 14px 16px;
+    background: linear-gradient(to top, #232a3d 70%, transparent);
+  }
+  .mood-grid {
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    gap: 8px; margin-bottom: 10px;
+  }
+  .mood-btn {
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+    padding: 9px 2px; border-radius: 12px; cursor: pointer;
+    background: rgba(255,255,255,.05);
+    border: 1px solid rgba(255,255,255,.07);
+    transition: all .18s; font-size: 10px; color: #cfc9bd;
+    user-select: none;
+  }
+  .mood-btn:hover { background: rgba(255,255,255,.12); transform: translateY(-2px); }
+  .mood-btn:active { transform: scale(.94); }
+  .mood-btn .emoji { font-size: 20px; }
+  #note-row { display: flex; gap: 8px; }
+  #note {
+    flex: 1; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 10px; padding: 9px 12px; color: #e8e4dc; font-size: 12px;
+    outline: none; font-family: inherit;
+  }
+  #note:focus { border-color: rgba(255,255,255,.25); }
+  #care-banner {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    background: rgba(180,120,90,.92); color: #fff; font-size: 11px;
+    padding: 7px 14px; border-radius: 20px; white-space: nowrap;
+    opacity: 0; transition: opacity .6s; pointer-events: none;
+    box-shadow: 0 4px 20px rgba(0,0,0,.4);
+  }
+  #care-banner.show { opacity: 1; }
+  .hint { text-align: center; font-size: 10px; opacity: .3; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>情绪花园</h1>
+    <span class="count" id="count">0 颗种子</span>
+  </header>
+  <div id="garden-wrap">
+    <canvas id="cv"></canvas>
+    <div id="care-banner">💛 花园有点阴郁了，记得关照自己</div>
+  </div>
+  <div id="mood-panel">
+    <div class="mood-grid" id="grid"></div>
+    <div id="note-row">
+      <input id="note" placeholder="想对这片花园说点什么…（可选）" maxlength="40">
+    </div>
+    <div class="hint">每一种情绪，都会在花园里留下痕迹</div>
+  </div>
+</div>
+
+<script>
+/* ---------- 情绪定义 ---------- */
+const MOODS = [
+  { key:'joy',    emoji:'🌞', name:'开心', type:'flower', color:'#ffd166', petal:'#ffb703' },
+  { key:'calm',   emoji:'🌿', name:'平静', type:'grass',  color:'#7fb069' },
+  { key:'love',   emoji:'💗', name:'温暖', type:'flower', color:'#ff8fab', petal:'#fb6f92' },
+  { key:'tired',  emoji:'🪨', name:'疲惫', type:'moss',   color:'#8a9a7b' },
+  { key:'sad',    emoji:'🌧️', name:'难过', type:'rain',   color:'#7aa2c7' },
+  { key:'anxious',emoji:'🌪️', name:'焦虑', type:'weed',   color:'#9a8c6a' },
+  { key:'angry',  emoji:'🔥', name:'生气', type:'thorn',  color:'#c0563b' },
+  { key:'empty',  emoji:'🌫️', name:'茫然', type:'fog',    color:'#b0b8c4' },
+];
+
+/* ---------- 存储 ---------- */
+const STORE_KEY = 'emotion-garden-v1';
+let records = JSON.parse(localStorage.getItem(STORE_KEY) || '[]');
+// record: { mood, note, ts }
+
+function save() { localStorage.setItem(STORE_KEY, JSON.stringify(records)); }
+
+/* ---------- 画布 ---------- */
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+let W, H, DPR;
+let plants = [];      // 渲染元素
+let particles = [];   // 飘落/动画粒子
+let gardenMood = 1;   // 0阴郁 ~ 1明亮
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  const rect = cv.parentElement.getBoundingClientRect();
+  W = rect.width; H = rect.height;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+
+/* ---------- 根据记录重建花园 ---------- */
+function rebuild() {
+  plants = [];
+  const n = records.length;
+  if (n === 0) return;
+
+  // 布局：按时间从下往上、从左到右生长
+  const groundY = H * 0.92;
+  const usableW = W - 60;
+  const perRow = Math.max(3, Math.floor(usableW / 44));
+  const rows = Math.ceil(n / perRow);
+  const rowGap = Math.min(46, (groundY - H*0.18) / Math.max(rows, 1));
+
+  records.forEach((r, i) => {
+    const row = Math.floor(i / perRow);
+    const col = i % perRow;
+    const inRow = Math.min(perRow, n - row*perRow);
+    const spread = (usableW) / Math.max(inRow, 1);
+    const x = 30 + spread*(col+0.5) + (Math.sin(i*7.3)*10);
+    const y = groundY - row*rowGap + Math.cos(i*3.1)*6;
+    plants.push(makePlant(r, x, y, i));
+  });
+
+  // 低落地检测：最近 N 条中负面占比
+  updateGardenMood();
+}
+
+function makePlant(rec, x, y, idx) {
+  const m = MOODS.find(mm => mm.key === rec.mood) || MOODS[1];
+  const p = { x, y, mood:m, seed: idx*1.7, born: idx, note: rec.note, ts: rec.ts };
+  // 随机形态参数
+  p.h = 14 + (Math.sin(idx*2.7)+1)*10;
+  p.phase = Math.random()*Math.PI*2;
+  p.sway = 0.6 + Math.random()*0.8;
+  p.scale = 0.8 + Math.random()*0.5;
+  return p;
+}
+
+/* ---------- 阴郁检测 ---------- */
+function updateGardenMood() {
+  const recent = records.slice(-12);
+  if (recent.length < 6) { gardenMood = 1; return; }
+  const neg = ['sad','tired','anxious','angry','empty'];
+  const negCount = recent.filter(r => neg.includes(r.mood)).length;
+  const ratio = negCount / recent.length;
+  gardenMood = ratio >= 0.6 ? 0.35 : ratio >= 0.4 ? 0.65 : 1;
+
+  const banner = document.getElementById('care-banner');
+  if (ratio >= 0.6) banner.classList.add('show');
+  else banner.classList.remove('show');
+}
+
+/* ---------- 生长动画 ---------- */
+let growTime = 0;
+function addRecord(moodKey, note) {
+  const rec = { mood: moodKey, note: note||'', ts: Date.now() };
+  records.push(rec);
+  save();
+  rebuild();
+  // 最后一株播放生长动画
+  if (plants.length) plants[plants.length-1].grow = 0;
+  growTime = performance.now();
+  updateCount();
+}
+
+function updateCount() {
+  document.getElementById('count').textContent = records.length + ' 颗种子';
+}
+
+/* ---------- 主循环 ---------- */
+let t0 = performance.now();
+function loop(now) {
+  const t = (now - t0) / 1000;
+  const dt = 1/60;
+  draw(t, dt);
+  requestAnimationFrame(loop);
+}
+
+function draw(t, dt) {
+  // 背景：天空随 mood 渐变
+  const skyTop = lerpColor('#2a3350', '#3a2f3a', 1-gardenMood);
+  const skyBot = lerpColor('#3b4560', '#4a3a3a', 1-gardenMood);
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0, skyTop); g.addColorStop(0.75, skyBot);
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+
+  // 月亮/光晕
+  ctx.save();
+  const mx = W*0.8, my = H*0.16;
+  const halo = ctx.createRadialGradient(mx,my,4, mx,my, 70);
+  halo.addColorStop(0, `rgba(255,240,200,${0.35*gardenMood})`);
+  halo.addColorStop(1, 'rgba(255,240,200,0)');
+  ctx.fillStyle = halo; ctx.beginPath(); ctx.arc(mx,my,70,0,7); ctx.fill();
+  ctx.restore();
+
+  // 地面
+  const groundY = H*0.92;
+  const gg = ctx.createLinearGradient(0, groundY-30, 0, H);
+  gg.addColorStop(0, lerpColor('#2e3a2a', '#2a2a2e', 1-gardenMood));
+  gg.addColorStop(1, lerpColor('#1e2620', '#1a1a1e', 1-gardenMood));
+  ctx.fillStyle = gg;
+  ctx.beginPath();
+  ctx.moveTo(0, groundY);
+  for (let x=0; x<=W; x+=20) {
+    ctx.lineTo(x, groundY + Math.sin(x*0.02)*3 - 4);
+  }
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath(); ctx.fill();
+
+  // 全局亮度滤镜
+  ctx.save();
+  ctx.globalAlpha = 0.55 + 0.45*gardenMood;
+
+  // 按出生顺序绘制，后出生的在上层
+  plants.forEach((p, i) => {
+    drawPlant(p, t);
+  });
+  ctx.restore();
+
+  // 氛围粒子：雨滴 / 飘落光点
+  updateParticles(t, dt);
+}
+
+function drawPlant(p, t) {
+  const { x, y, mood } = p;
+  let grow = p.grow !== undefined ? Math.min(1, (performance.now()-growTime)/500) : 1;
+  if (p.grow !== undefined && grow >= 1) delete p.grow;
+  const s = p.scale * grow;
+  if (s < 0.02) return;
+
+  const sway = Math.sin(t*p.sway + p.phase) * 1.6 * s;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(s, s);
+  ctx.globalAlpha = gardenMood < 1 ? 0.6 + 0.4*gardenMood : 1;
+
+  const type = mood.type;
+  if (type === 'flower') {
+    // 茎
+    ctx.strokeStyle = '#5d7a4a'; ctx.lineWidth = 1.6; ctx.lineCap='round';
+    const topY = -p.h;
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.quadraticCurveTo(sway*0.5, topY*0.5, sway, topY);
+    ctx.stroke();
+    // 叶
+    ctx.fillStyle = '#6b8a52';
+    ctx.beginPath(); ctx.ellipse(sway*0.3-4, topY*0.5, 4, 2.2, -0.6, 0, 7); ctx.fill();
+    // 花瓣
+    const px = sway, py = topY;
+    ctx.fillStyle = mood.color;
+    for (let k=0;k<5;k++){
+      const a = k/5*Math.PI*2 + t*0.1;
+      ctx.beginPath();
+      ctx.ellipse(px+Math.cos(a)*4, py+Math.sin(a)*4, 3.4, 3.4, a, 0, 7);
+      ctx.fill();
+    }
+    ctx.fillStyle = mood.petal;
+    ctx.beginPath(); ctx.arc(px, py, 2.6, 0, 7); ctx.fill();
+  }
+  else if (type === 'grass') {
+    ctx.strokeStyle = mood.color; ctx.lineWidth = 1.8; ctx.lineCap='round';
+    for (let k=-1;k<=1;k++){
+      ctx.beginPath();
+      ctx.moveTo(k*3, 0);
+      ctx.quadraticCurveTo(k*3+sway*0.6, -p.h*0.6, k*4+sway, -p.h);
+      ctx.stroke();
+    }
+  }
+  else if (type === 'moss') {
+    ctx.fillStyle = mood.color;
+    for (let k=0;k<6;k++){
+      const a = p.seed + k*1.7;
+      ctx.beginPath();
+      ctx.ellipse(Math.cos(a)*7, Math.sin(a)*2-1, 3.5, 2, 0, 0, 7);
+      ctx.fill();
+    }
+  }
+  else if (type === 'rain') {
+    // 小水洼 + 涟漪
+    ctx.fillStyle = 'rgba(120,162,199,.45)';
+    ctx.beginPath(); ctx.ellipse(0, 0, 9, 3, 0, 0, 7); ctx.fill();
+    for (let k=0;k<2;k++){
+      const r = ((t*0.7 + k*0.5 + p.phase) % 1) * 10;
+      ctx.strokeStyle = `rgba(150,190,220,${0.5*(1-r/10)})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.ellipse(0, 0, r, r*0.35, 0, 0, 7); ctx.stroke();
+    }
+    // 雨滴
+    ctx.strokeStyle = 'rgba(150,190,220,.5)'; ctx.lineWidth = 1;
+    for (let k=0;k<2;k++){
+      const dy = -((t*40 + k*18 + p.phase*30) % 60);
+      ctx.beginPath();
+      ctx.moveTo(-2+k*4, dy);
+      ctx.lineTo(-2+k*4 - 1, dy-6);
+      ctx.stroke();
+    }
+  }
+  else if (type === 'weed') {
+    ctx.strokeStyle = mood.color; ctx.lineWidth = 1.2; ctx.lineCap='round';
+    for (let k=0;k<4;k++){
+      const a = -Math.PI/2 + (k-1.5)*0.5 + sway*0.05;
+      const len = p.h*0.7;
+      ctx.beginPath();
+      ctx.moveTo(0,0);
+      ctx.lineTo(Math.cos(a)*len, Math.sin(a)*len);
+      ctx.stroke();
+    }
+  }
+  else if (type === 'thorn') {
+    ctx.strokeStyle = '#8a4a35'; ctx.lineWidth = 2; ctx.lineCap='round';
+    ctx.beginPath();
+    ctx.moveTo(0,0); ctx.lineTo(sway*0.4, -p.h);
+    ctx.stroke();
+    ctx.strokeStyle = mood.color; ctx.lineWidth = 1;
+    for (let k=1;k<=3;k++){
+      const yy = -p.h*(k/4);
+      ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(4, yy-3); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, yy); ctx.lineTo(-4, yy-3); ctx.stroke();
+    }
+  }
+  else if (type === 'fog') {
+    ctx.fillStyle = 'rgba(176,184,196,.25)';
+    for (let k=0;k<3;k++){
+      const a = p.seed + k*2.1 + t*0.05;
+      ctx.beginPath();
+      ctx.ellipse(Math.cos(a)*8, Math.sin(a)*3-6, 10, 5, 0, 0, 7);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+
+  // 悬浮备注点（可选）
+  if (p.note) {
+    ctx.fillStyle = 'rgba(255,255,255,.5)';
+    ctx.font = '10px sans-serif';
+  }
+}
+
+/* ---------- 粒子 ---------- */
+function updateParticles(t, dt) {
+  // 根据花园里雨/雾/花生成氛围粒子
+  const hasRain = plants.some(p => p.mood.type === 'rain');
+  if (hasRain && Math.random() < 0.15) {
+    particles.push({ x: Math.random()*W, y: -10, vy: 120+Math.random()*80, type:'rain', life:1 });
+  }
+  if (gardenMood < 1 && Math.random() < 0.02) {
+    particles.push({ x: Math.random()*W, y: -10, vy: 20+Math.random()*20, type:'fog', life:1, drift:Math.random()*0.4-0.2 });
+  }
+  // 明亮时飘光点
+  if (gardenMood > 0.8 && Math.random() < 0.03) {
+    particles.push({ x: Math.random()*W, y: H*0.3+Math.random()*H*0.5, vy: -8-Math.random()*10, type:'spark', life:1 });
+  }
+
+  particles = particles.filter(pt => pt.life > 0);
+  particles.forEach(pt => {
+    pt.y += pt.vy * dt;
+    if (pt.drift) pt.x += pt.drift * 60 * dt;
+    if (pt.type === 'rain') {
+      ctx.strokeStyle = `rgba(150,190,220,${0.35*pt.life})`;
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(pt.x, pt.y); ctx.lineTo(pt.x-1, pt.y+7); ctx.stroke();
+      if (pt.y > H*0.9) pt.life = 0;
+    } else if (pt.type === 'fog') {
+      ctx.fillStyle = `rgba(176,184,196,${0.06*pt.life})`;
+      ctx.beginPath(); ctx.ellipse(pt.x, pt.y, 26, 12, 0, 0, 7); ctx.fill();
+      if (pt.y > H) pt.life = 0;
+    } else if (pt.type === 'spark') {
+      ctx.fillStyle = `rgba(255,240,190,${0.5*Math.sin(t*2+pt.x)})`;
+      ctx.beginPath(); ctx.arc(pt.x, pt.y, 1.5, 0, 7); ctx.fill();
+      if (pt.y < -10) pt.life = 0;
+    }
+    pt.life -= (pt.type==='rain'? 0.4 : 0.15) * dt;
+    if (pt.life < 0) pt.life = 0;
+  });
+}
+
+/* ---------- 工具 ---------- */
+function lerpColor(a, b, t) {
+  const pa = hex(a), pb = hex(b);
+  const r = Math.round(pa[0]+(pb[0]-pa[0])*t);
+  const g = Math.round(pa[1]+(pb[1]-pa[1])*t);
+  const bl = Math.round(pa[2]+(pb[2]-pa[2])*t);
+  return `rgb(${r},${g},${bl})`;
+}
+function hex(h) {
+  h = h.replace('#','');
+  return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)];
+}
+
+/* ---------- UI ---------- */
+function buildGrid() {
+  const grid = document.getElementById('grid');
+  MOODS.forEach(m => {
+    const btn = document.createElement('div');
+    btn.className = 'mood-btn';
+    btn.innerHTML = `<span class="emoji">${m.emoji}</span><span>${m.name}</span>`;
+    btn.onclick = () => {
+      const note = document.getElementById('note').value.trim();
+      addRecord(m.key, note);
+      document.getElementById('note').value = '';
+      btn.animate([{transform:'scale(1)'},{transform:'scale(0.85)'},{transform:'scale(1)'}],{duration:220});
+    };
+    grid.appendChild(btn);
+  });
+}
+
+/* ---------- 启动 ---------- */
+function init() {
+  resize();
+  buildGrid();
+  rebuild();
+  updateCount();
+  window.addEventListener('resize', () => { resize(); rebuild(); });
+  requestAnimationFrame(loop);
+}
+init();
+</script>
+</body>
+</html>
